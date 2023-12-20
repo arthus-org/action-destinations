@@ -9,7 +9,7 @@ import {
 } from './operationTracking'
 import { EngageActionPerformer } from './EngageActionPerformer'
 import { OperationContext } from './track'
-import { ResponseError } from './ResponseError'
+import { getErrorDetails } from './ResponseError'
 
 export class EngageStats extends OperationStats {
   static getTryCatchFinallyHook(_ctx: OperationStatsContext): TryCatchFinallyHook<OperationStatsContext> {
@@ -26,9 +26,13 @@ export class EngageStats extends OperationStats {
     ctx.sharedContext.tags.push(
       `space_id:${this.actionPerformer.settings.spaceId}`,
       `projectid:${this.actionPerformer.settings.sourceId}`,
-      `region:${this.actionPerformer.settings.region}`,
+      `settings_region:${this.actionPerformer.settings.region}`,
       `channel:${this.actionPerformer.getChannelType()}`
     )
+    const correlation_id =
+      this.actionPerformer.payload.customArgs?.correlation_id ||
+      this.actionPerformer.payload.customArgs?.__segment_internal_correlation_id__
+    if (correlation_id) ctx.sharedContext.tags.push(`correlation_id:${correlation_id}`)
 
     //for operations like request which can be used in multiple places, we need to have operation_path tag that will show where this operation is invoked from
     const parentOperation = (ctx as OperationContext).parent
@@ -96,12 +100,9 @@ export class EngageStats extends OperationStats {
   extractTagsFromError(error: TrackedError, ctx: OperationStatsContext): string[] {
     const res = super.extractTagsFromError(error, ctx)
 
-    const respError = error as ResponseError
-    const error_code = respError?.response?.data?.code || respError?.code
-    if (error_code) res.push(`error_code:${error_code}`)
-
-    const error_status = respError?.response?.data?.status || respError?.status
-    if (error_status) res.push(`error_status:${error_status}`)
+    const errDetails = getErrorDetails(error)
+    if (errDetails?.code) res.push(`error_code:${errDetails.code}`)
+    if (errDetails?.status) res.push(`error_status:${errDetails.status}`)
 
     if (error.underlyingError) {
       const underlyingErrorTags = this.extractTagsFromError(error.underlyingError as any, ctx)

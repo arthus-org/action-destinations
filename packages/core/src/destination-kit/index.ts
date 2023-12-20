@@ -1,6 +1,17 @@
 import { validate, parseFql, ErrorCondition } from '@segment/destination-subscriptions'
+import { EventEmitterSlug } from '@segment/action-emitters'
 import type { JSONSchema4 } from 'json-schema'
-import { Action, ActionDefinition, BaseActionDefinition, RequestFn, ExecuteDynamicFieldInput } from './action'
+import {
+  Action,
+  ActionDefinition,
+  ActionHookDefinition,
+  ActionHookType,
+  hookTypeStrings,
+  ActionHookResponse,
+  BaseActionDefinition,
+  RequestFn,
+  ExecuteDynamicFieldInput
+} from './action'
 import { time, duration } from '../time'
 import { JSONLikeObject, JSONObject, JSONValue } from '../json-object'
 import { SegmentEvent } from '../segment-event'
@@ -8,7 +19,15 @@ import { fieldsToJsonSchema, MinimalInputField } from './fields-to-jsonschema'
 import createRequestClient, { RequestClient, ResponseError } from '../create-request-client'
 import { validateSchema } from '../schema-validation'
 import type { ModifiedResponse } from '../types'
-import type { GlobalSetting, RequestExtension, ExecuteInput, Result, Deletion, DeletionPayload } from './types'
+import type {
+  GlobalSetting,
+  RequestExtension,
+  ExecuteInput,
+  Result,
+  Deletion,
+  DeletionPayload,
+  DynamicFieldResponse
+} from './types'
 import type { AllRequestOptions } from '../request-client'
 import { ErrorCodes, IntegrationError, InvalidAuthenticationError } from '../errors'
 import { AuthTokens, getAuthData, getOAuth2Data, updateOAuthSettings } from './parse-settings'
@@ -16,7 +35,16 @@ import { InputData, Features } from '../mapping-kit'
 import { retry } from '../retry'
 import { HTTPError } from '..'
 
-export type { BaseActionDefinition, ActionDefinition, ExecuteInput, RequestFn }
+export type {
+  BaseActionDefinition,
+  ActionDefinition,
+  ActionHookDefinition,
+  ActionHookResponse,
+  ActionHookType,
+  ExecuteInput,
+  RequestFn
+}
+export { hookTypeStrings }
 export type { MinimalInputField }
 export { fieldsToJsonSchema }
 
@@ -58,7 +86,7 @@ export interface BaseDefinition {
   actions: Record<string, BaseActionDefinition>
 
   /** Subscription presets automatically applied in quick setup */
-  presets?: Subscription[]
+  presets?: Preset[]
 }
 
 export type AudienceResult = {
@@ -73,6 +101,8 @@ export type CreateAudienceInput<Settings = unknown, AudienceSettings = unknown> 
   audienceSettings?: AudienceSettings
 
   audienceName: string
+
+  statsContext?: StatsContext
 }
 
 export type GetAudienceInput<Settings = unknown, AudienceSettings = unknown> = {
@@ -81,6 +111,8 @@ export type GetAudienceInput<Settings = unknown, AudienceSettings = unknown> = {
   audienceSettings?: AudienceSettings
 
   externalId: string
+
+  statsContext?: StatsContext
 }
 
 export interface AudienceDestinationConfiguration {
@@ -137,6 +169,15 @@ export interface DestinationDefinition<Settings = unknown> extends BaseDefinitio
 
   onDelete?: Deletion<Settings>
 }
+
+interface AutomaticPreset extends Subscription {
+  type: 'automatic'
+}
+interface SpecificEventPreset extends Omit<Subscription, 'subscribe'> {
+  type: 'specificEvent'
+  eventSlug: EventEmitterSlug
+}
+export type Preset = AutomaticPreset | SpecificEventPreset
 
 export interface Subscription {
   name?: string
@@ -238,6 +279,7 @@ interface EventInput<Settings> {
   readonly features?: Features
   readonly statsContext?: StatsContext
   readonly logger?: Logger
+  readonly dataFeedCache?: DataFeedCache
   readonly transactionContext?: TransactionContext
   readonly stateContext?: StateContext
 }
@@ -252,6 +294,7 @@ interface BatchEventInput<Settings> {
   readonly features?: Features
   readonly statsContext?: StatsContext
   readonly logger?: Logger
+  readonly dataFeedCache?: DataFeedCache
   readonly transactionContext?: TransactionContext
   readonly stateContext?: StateContext
 }
@@ -267,6 +310,7 @@ interface OnEventOptions {
   features?: Features
   statsContext?: StatsContext
   logger?: Logger
+  readonly dataFeedCache?: DataFeedCache
   transactionContext?: TransactionContext
   stateContext?: StateContext
   /** Handler to perform synchronization. If set, the refresh access token method will be synchronized across
@@ -318,6 +362,13 @@ export interface Logger {
   crit(...message: string[]): void
   log(...message: string[]): void
   withTags(extraTags: any): void
+}
+
+export interface DataFeedCache {
+  setRequestResponse(requestId: string, response: string, expiryInSeconds: number): Promise<void>
+  getRequestResponse(requestId: string): Promise<string | null>
+  maxResponseSizeBytes: number
+  maxExpirySeconds: number
 }
 
 export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
@@ -496,6 +547,7 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
       features,
       statsContext,
       logger,
+      dataFeedCache,
       transactionContext,
       stateContext
     }: EventInput<Settings>
@@ -519,6 +571,7 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
       features,
       statsContext,
       logger,
+      dataFeedCache,
       transactionContext,
       stateContext
     })
@@ -534,6 +587,7 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
       features,
       statsContext,
       logger,
+      dataFeedCache,
       transactionContext,
       stateContext
     }: BatchEventInput<Settings>
@@ -558,6 +612,7 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
       features,
       statsContext,
       logger,
+      dataFeedCache,
       transactionContext,
       stateContext
     })
@@ -568,14 +623,18 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
   public async executeDynamicField(
     actionSlug: string,
     fieldKey: string,
-    data: ExecuteDynamicFieldInput<Settings, object>
+    data: ExecuteDynamicFieldInput<Settings, object>,
+    /**
+     * The dynamicFn argument is optional since it is only used by dynamic hook input fields. (For now)
+     */
+    dynamicFn?: RequestFn<Settings, any, DynamicFieldResponse, AudienceSettings>
   ) {
     const action = this.actions[actionSlug]
     if (!action) {
       return []
     }
 
-    return action.executeDynamicField(fieldKey, data)
+    return action.executeDynamicField(fieldKey, data, dynamicFn)
   }
 
   private async onSubscription(
@@ -594,6 +653,7 @@ export class Destination<Settings = JSONObject, AudienceSettings = JSONObject> {
       features: options?.features || {},
       statsContext: options?.statsContext || ({} as StatsContext),
       logger: options?.logger,
+      dataFeedCache: options?.dataFeedCache,
       transactionContext: options?.transactionContext,
       stateContext: options?.stateContext
     }

@@ -2,7 +2,7 @@ import { ActionDefinition, PayloadValidationError } from '@segment/actions-core'
 import type { Settings } from '../generated-types'
 import { HUBSPOT_BASE_URL } from '../properties'
 import type { Payload } from './generated-types'
-import { flattenObject } from '../utils'
+import { flattenObject, transformEventName } from '../utils'
 
 interface CustomBehavioralEvent {
   eventName: string
@@ -68,8 +68,10 @@ const action: ActionDefinition<Settings, Payload> = {
     }
   },
   perform: (request, { payload, settings }) => {
+    const eventName = transformEventName(payload.eventName)
+
     const event: CustomBehavioralEvent = {
-      eventName: payload.eventName,
+      eventName: eventName,
       occurredAt: payload.occurredAt,
       utk: payload.utk,
       email: payload.email,
@@ -80,10 +82,10 @@ const action: ActionDefinition<Settings, Payload> = {
     const hubId = settings?.portalId
     const regExp = /^pe\d+_.*/
 
-    if (!hubId && !regExp.exec(payload?.eventName)) {
+    if (!hubId && !regExp.exec(event?.eventName)) {
       throw new PayloadValidationError(`EventName should begin with pe<hubId>_`)
     }
-    if (hubId && !payload?.eventName.startsWith(`pe${hubId}_`)) {
+    if (hubId && !event?.eventName.startsWith(`pe${hubId}_`)) {
       throw new PayloadValidationError(`EventName should begin with pe${hubId}_`)
     }
 
